@@ -1,109 +1,159 @@
 import os
-from datetime import date, timedelta
-import pathlib
-import time
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import json
+from datetime import date, timedelta
+import pathlib
+import time
 
-
-# Define the retry strategy
+# Configure retries for handling network issues and rate limiting
 retry_strategy = Retry(
-    total=4,  # Maximum number of retries
-    backoff_factor=2, # Exponential backoff factor (e.g., 2 means 1, 2, 4, 8 seconds, ...)
-    status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry on
+    total=3,  # Maximum number of retries
+    backoff_factor=1,  # Exponential backoff between retries (1, 2, 4 seconds)
+    status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
 )
-
-# Create an HTTP adapter with the retry strategy and mount it to session
 adapter = HTTPAdapter(max_retries=retry_strategy)
+http = requests.Session()
+http.mount("https://", adapter)
+http.mount("http://", adapter)
 
-# Create a new session object
-session = requests.Session()
-session.mount('http://', adapter)
-session.mount('https://', adapter)
+files = []  # List to store downloaded file paths
 
-
-files = []
-
-
-# Function to download the URL, called asynchronously by several child processes
 def download_url(url, download_path, name=None):
+    """
+    Downloads a file from the given URL and saves it to the specified path.
+
+    Args:
+        url: The URL of the file to download.
+        download_path: The directory where the file should be saved.
+        name: (Optional) The desired filename for the downloaded file.
+              If not provided, the filename will be extracted from the URL.
+    """
     try:
         global files
-        if name:
-            file_name = os.path.join(download_path, name)
-        else:
-            file_name = os.path.join(download_path, os.path.basename(url))
+
+        # Determine the filename
+        file_name = os.path.join(download_path, name) if name else os.path.join(download_path, os.path.basename(url))
+
+        # Create the directory if it doesn't exist
         dir_path = os.path.dirname(file_name)
-        pathlib.Path(dir_path).mkdir(parents=True, exist_ok=True) 
-        if os.path.isfile(file_name):
-            # print(f"{file_name} already exists")
-            return
-        # Make a request using the session object
-        response = session.get(url)
-        if response.status_code == 404:
-            print(f"File does not exist: {url}")
-        elif response.status_code == 200:
-            with open(file_name, 'wb') as f:
-                f.write(response.content)
-            # print(f"Downloaded: {url} to {file_name}")
-            files.append(file_name)
-            return
-        else:
-            print(f"Failed to download {url}")
-            return
-    except Exception as e:
-        print(str(e))
+        os.makedirs(dir_path, exist_ok=True)
 
+        # Skip download if the file already exists
+        if os.path.exists(file_name):
+            print(f"{file_name} already exists. Skipping download.")
+            return
 
-# Function to generate a range of dates
+        # Make the request using the session with retry strategy
+        response = http.get(url, timeout=10)  # Set a timeout to prevent hanging requests
+        response.raise_for_status()  # Raise an exception for bad status codes
+
+        # Save the file
+        with open(file_name, 'wb') as f:
+            f.write(response.content)
+        print(f"Downloaded: {url} to {file_name}")
+        files.append(file_name)
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading {url}: {e}")
+
 def daterange(start_date, end_date):
-    for n in range(int((end_date - start_date).days)):
+    """
+    Generates a range of dates between the start and end dates (inclusive).
+
+    Args:
+        start_date: The start date (datetime.date object).
+        end_date: The end date (datetime.date object).
+
+    Yields:
+        datetime.date objects representing each date in the range.
+    """
+    for n in range(int((end_date - start_date).days) + 1):
         yield start_date + timedelta(n)
 
-
-# Function to download daily data from Binance
 def download_binance_daily_data(pair, training_days, region, download_path):
-    base_url = f"https://data.binance.vision/data/spot/daily/klines"
+    """
+    Downloads daily kline data from Binance for the specified pair and time range.
 
+    Args:
+        pair: The trading pair (e.g., "BTCUSDT").
+        training_days: The number of days of historical data to download.
+        region: The Binance region (e.g., "us").
+        download_path: The directory where the downloaded files should be saved.
+
+    Returns:
+        A list of downloaded file paths.
+    """
+    base_url = f"https://data.binance.vision/data/spot/daily/klines"
     end_date = date.today()
     start_date = end_date - timedelta(days=int(training_days))
-    
+
     global files
-    files = []
+    files = []  # Reset the files list for each download
 
     with ThreadPoolExecutor() as executor:
-        print(f"Downloading data for {pair}")
+        print(f"Downloading Binance daily data for {pair} from {start_date} to {end_date}")
         for single_date in daterange(start_date, end_date):
-            url = f"{base_url}/{pair}/1m/{pair}-1m-{single_date}.zip"
+            url = f"{base_url}/{pair}/1m/{pair}-1m-{single_date.strftime('%Y-%m-%d')}.zip"
             executor.submit(download_url, url, download_path)
-    
+        # Wait for all downloads to complete
+        executor.shutdown(wait=True)
+
     return files
 
-
 def download_binance_current_day_data(pair, region):
+    """
+    Downloads kline data for the current day from the Binance API.
+
+    Args:
+        pair: The trading pair (e.g., "BTCUSDT").
+        region: The Binance region (e.g., "us").
+
+    Returns:
+        A pandas DataFrame containing the downloaded kline data.
+    """
     limit = 1000
     base_url = f'https://api.binance.{region}/api/v3/klines?symbol={pair}&interval=1m&limit={limit}'
 
-    # Make a request using the session object
-    response = session.get(base_url)
+    response = http.get(base_url)
     response.raise_for_status()
-    resp = str(response.content, 'utf-8').rstrip()
 
-    columns = ['start_time','open','high','low','close','volume','end_time','volume_usd','n_trades','taker_volume','taker_volume_usd','ignore']
-    
-    df = pd.DataFrame(json.loads(resp),columns=columns)
-    df['date'] = [pd.to_datetime(x+1,unit='ms') for x in df['end_time']]
-    df['date'] = df['date'].apply(pd.to_datetime)
-    df[["volume", "taker_volume", "open", "high", "low", "close"]] = df[["volume", "taker_volume", "open", "high", "low", "close"]].apply(pd.to_numeric)
+    data = response.json()
+    columns = ['start_time', 'open', 'high', 'low', 'close', 'volume', 'end_time',
+               'volume_usd', 'n_trades', 'taker_volume', 'taker_volume_usd', 'ignore']
+
+    df = pd.DataFrame(data, columns=columns)
+    df['date'] = pd.to_datetime(df['end_time'] + 1, unit='ms') 
+    df.drop(columns=["end_time", "ignore"], inplace=True)
+    df.set_index("date", inplace=True)
+    # Convert relevant columns to numeric
+    df = df.astype({
+        'volume': float, 
+        'taker_volume': float, 
+        'open': float, 
+        'high': float, 
+        'low': float, 
+        'close': float
+    })
 
     return df.sort_index()
 
-
 def get_coingecko_coin_id(token):
+    """
+    Maps a token symbol to its corresponding Coingecko coin ID.
+
+    Args:
+        token: The cryptocurrency token symbol (e.g., "BTC").
+
+    Returns:
+        The Coingecko coin ID.
+
+    Raises:
+        ValueError: If the token is not supported.
+    """
     token_map = {
         'ETH': 'ethereum',
         'SOL': 'solana',
@@ -112,64 +162,41 @@ def get_coingecko_coin_id(token):
         'ARB': 'arbitrum',
         # Add more tokens here
     }
-    
+
     token = token.upper()
     if token in token_map:
         return token_map[token]
     else:
         raise ValueError("Unsupported token")
 
-
 def download_coingecko_data(token, training_days, download_path, CG_API_KEY):
-    if training_days <= 7:
-        days = 7
-    elif training_days <= 14:
-        days = 14
-    elif training_days <= 30:
-        days = 30
-    elif training_days <= 90:
-        days = 90
-    elif training_days <= 180:
-        days = 180
-    elif training_days <= 365:
-        days = 365
-    else:
-        days = "max"
-    print(f"Days: {days}")
+    """
+    Downloads historical OHLC data from Coingecko for the specified token and time range.
+
+    Args:
+        token: The cryptocurrency token symbol (e.g., "BTC").
+        training_days: The number of days of historical data to download.
+        download_path: The directory where the downloaded file should be saved.
+        CG_API_KEY: The Coingecko API key.
+
+    Returns:
+        A list containing the downloaded file path.
+    """
+
+    # Map training_days to Coingecko's supported durations
+    days_map = {
+        7: 7,
+        14: 14,
+        30: 30,
+        90: 90,
+        180: 180,
+        365: 365,
+    }
+    days = days_map.get(training_days, "max") 
 
     coin_id = get_coingecko_coin_id(token)
-    print(f"Coin ID: {coin_id}")
 
-    # Get OHLC data from Coingecko
     url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}&api_key={CG_API_KEY}'
 
     global files
-    files = []
-
-    with ThreadPoolExecutor() as executor:
-        print(f"Downloading data for {coin_id}")
-        name = os.path.basename(url).split("?")[0].replace("/", "_") + ".json"
-        executor.submit(download_url, url, download_path, name)
-    
-    return files
-
-
-def download_coingecko_current_day_data(token, CG_API_KEY):
-    coin_id = get_coingecko_coin_id(token)
-    print(f"Coin ID: {coin_id}")
-
-    url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days=1&api_key={CG_API_KEY}'
-
-    # Make a request using the session object
-    response = session.get(url)
-    response.raise_for_status()
-    resp = str(response.content, 'utf-8').rstrip()
-
-    columns = ['timestamp','open','high','low','close']
-    
-    df = pd.DataFrame(json.loads(resp), columns=columns)
-    df['date'] = [pd.to_datetime(x,unit='ms') for x in df['timestamp']]
-    df['date'] = df['date'].apply(pd.to_datetime)
-    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].apply(pd.to_numeric)
-
-    return df.sort_index()
+    files = []  # Reset the files list for each download
