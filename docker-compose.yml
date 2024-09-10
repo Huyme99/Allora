@@ -1,47 +1,49 @@
+version: '3.8' # Specify a recent version for better compatibility
+
 services:
   inference:
     container_name: inference
     env_file:
-      - .env
-    build: .
-    command: python -u /app/app.py
+      - .env  # Load environment variables from .env file
+    build: .  # Build the image from the current directory's Dockerfile
+    command: python -u /app/app.py  # Run the Flask app in unbuffered mode
     ports:
-      - "8000:8000"
+      - "8000:8000"  # Expose port 8000 from the container
     healthcheck:
       test: ["CMD", "curl", "-f", "http://inference:8000/inference/${TOKEN}"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
+      interval: 10s  # Check health every 10 seconds
+      timeout: 5s  # Timeout after 5 seconds
+      retries: 12  # Retry 12 times before considering unhealthy
     volumes:
-      - ./inference-data:/app/data
-  
+      - ./inference-data:/app/data  # Mount a volume for persistent data
+
   updater:
     container_name: updater
-    build: .
+    build: . 
     environment:
-      - INFERENCE_API_ADDRESS=http://inference:8000
+      - INFERENCE_API_ADDRESS=http://inference:8000  # Set the inference API address
     command: >
       sh -c "
       while true; do
-        python -u /app/update_app.py;
-        sleep 24h;
+        python -u /app/update_app.py;  # Run the update script
+        sleep 24h;  # Wait for 24 hours before the next update
       done
       "
     depends_on:
       inference:
-        condition: service_healthy
+        condition: service_healthy  # Wait for the inference service to be healthy
 
   worker:
     container_name: worker
-    image: alloranetwork/allora-offchain-node:v0.3.0
+    image: alloranetwork/allora-offchain-node:v0.3.0 
     volumes:
-      - ./worker-data:/data
+      - ./worker-data:/data  # Mount a volume for persistent worker data
     depends_on:
       inference:
-        condition: service_healthy
+        condition: service_healthy 
     env_file:
-      - ./worker-data/env_file
+      - ./worker-data/env_file  # Load environment variables from worker-data
 
 volumes:
-  inference-data:
+  inference-data:  # Define named volumes for better management
   worker-data:
